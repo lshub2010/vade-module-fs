@@ -194,6 +194,10 @@ def resolve_path(path: Any) -> tuple[Path, Path, str]:
         raise ToolFailure(
             "INVALID_ARGUMENT", f"path cannot be resolved: {exc.strerror or 'invalid path'}"
         ) from None
+    except RuntimeError:
+        # pathlib raises RuntimeError (not OSError) for a symlink loop:
+        # `Symlink loop from '<path>'`. A loop is a refusal, not a 500.
+        raise ToolFailure("PERMISSION_DENIED", "path cannot be resolved") from None
 
     for root in roots:
         if real == root or real.is_relative_to(root):
