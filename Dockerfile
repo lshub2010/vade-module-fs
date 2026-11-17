@@ -38,4 +38,9 @@ VOLUME ["/data"]
 # with `protocol/core` present. Without it only --standalone works, which is
 # intentional: a container that cannot authenticate must say so, not fall back.
 STOPSIGNAL SIGTERM
-CMD ["python", "-m", "fs_module", "--core", "wss://core:8443"]
+
+# ENTRYPOINT, not just CMD: `docker run vade/fs:dev --standalone fs_list ...`
+# has to append to `python -m fs_module`, not replace it (a bare CMD makes
+# docker exec `--standalone` as a binary).
+ENTRYPOINT ["python", "-m", "fs_module"]
+CMD ["--core", "wss://core:8443"]
