@@ -1,0 +1,129 @@
+{
+  "capabilities": {
+    "tools": [
+      {
+        "description": "列出目录下的直接子项（不递归）：name/kind/size/mtime；超过 10000 条截断",
+        "idempotent": true,
+        "input_schema": {
+          "additionalProperties": false,
+          "properties": {
+            "path": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "path"
+          ],
+          "type": "object"
+        },
+        "name": "fs_list",
+        "risk": "low",
+        "timeout_ms": 10000
+      },
+      {
+        "description": "返回路径的 kind/size/mtime/mode（软链先解析，越界软链拒绝）",
+        "idempotent": true,
+        "input_schema": {
+          "additionalProperties": false,
+          "properties": {
+            "path": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "path"
+          ],
+          "type": "object"
+        },
+        "name": "fs_stat",
+        "risk": "low",
+        "timeout_ms": 10000
+      },
+      {
+        "description": "读取 UTF-8 文本文件；超过 max_bytes 截断，二进制或非法 UTF-8 拒绝",
+        "idempotent": true,
+        "input_schema": {
+          "additionalProperties": false,
+          "properties": {
+            "max_bytes": {
+              "default": 65536,
+              "type": "integer"
+            },
+            "path": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "path"
+          ],
+          "type": "object"
+        },
+        "name": "fs_read",
+        "risk": "low",
+        "timeout_ms": 10000
+      },
+      {
+        "description": "写入 UTF-8 文本文件（高风险：会创建或覆盖文件）",
+        "idempotent": false,
+        "input_schema": {
+          "additionalProperties": false,
+          "properties": {
+            "content": {
+              "type": "string"
+            },
+            "create_parents": {
+              "default": false,
+              "type": "boolean"
+            },
+            "path": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "path",
+            "content"
+          ],
+          "type": "object"
+        },
+        "name": "fs_write",
+        "risk": "high",
+        "timeout_ms": 15000
+      },
+      {
+        "description": "删除文件或目录（高风险：recursive=true 才删非空目录）",
+        "idempotent": true,
+        "input_schema": {
+          "additionalProperties": false,
+          "properties": {
+            "path": {
+              "type": "string"
+            },
+            "recursive": {
+              "default": false,
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "path"
+          ],
+          "type": "object"
+        },
+        "name": "fs_delete",
+        "risk": "high",
+        "timeout_ms": 15000
+      }
+    ]
+  },
+  "concurrency": "exclusive",
+  "display_name": "文件模块",
+  "instance_id": "main",
+  "limits": {
+    "max_concurrency": 4,
+    "max_payload": 65519
+  },
+  "module_id": "com.example.fs",
+  "priority": 0,
+  "protocol": "vade/v1",
+  "role": "tool",
+  "version": "1.0.0"
+}
