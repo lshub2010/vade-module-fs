@@ -147,7 +147,7 @@ modules/fs/
 pip install -e sdk/python          # 或 pip install "vade-sdk==0.1.*"
 pip install -e modules/fs
 
-pytest modules/fs/tests -q         # 64 passed（无 core；无 SDK 时 server 测试 skip）
+pytest modules/fs/tests -q         # 65 passed（无 core；无 SDK 时 server 测试 skip）
 python -m fs_module --check        # exit 0，并把 manifest 打到 stdout
 
 FS_ROOTS=/data/workspace \

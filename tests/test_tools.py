@@ -275,6 +275,13 @@ def test_read_trims_a_multibyte_character_cut_by_the_window(box: Sandbox):
     assert result["truncated"] is True
 
 
+def test_read_window_entirely_inside_one_character(box: Sandbox):
+    """max_bytes=1 over `你` is an empty window, not a binary file."""
+    (box.root / "u.txt").write_bytes("你".encode("utf-8") * 10)
+    result = tools.fs_read("u.txt", max_bytes=1)
+    assert result == {"text": "", "bytes": 0, "truncated": True}
+
+
 def test_read_rejects_binary_and_invalid_utf8(box: Sandbox):
     (box.root / "bin").write_bytes(b"abc\x00def")
     _failure("INVALID_ARGUMENT", tools.fs_read, "bin")

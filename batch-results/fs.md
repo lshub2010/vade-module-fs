@@ -3,7 +3,7 @@
 - 仓库：`/root/HermesWorkspace/Vade-module-fs`（新仓，骨架拷自 `Vade-module-echo`）
 - 提交：`d91068c` 模块本体；`0dcf4ba` Dockerfile ENTRYPOINT 修复；本条报告单独一个 commit
 - 工作树：clean（写完本文件后提交）
-- 验证：`pytest tests -q` → **64 passed**；`--print-manifest` 与 `manifest.json` diff 空；
+- 验证：`pytest tests -q` → **65 passed**；`--print-manifest` 与 `manifest.json` diff 空；
   docker 镜像构建成功并实测 list/read/write + 越界拒绝。**未连 core**（无 core 实例）。
 
 ## 一、交付物

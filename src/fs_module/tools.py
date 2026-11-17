@@ -355,13 +355,14 @@ def fs_read(path: str, max_bytes: int = DEFAULT_MAX_BYTES) -> dict[str, Any]:
 def _decode_truncated(data: bytes) -> str | None:
     """Decode a window that may have cut a multi-byte character in half.
 
-    A 64 KiB window ending mid-`你` is not a binary file. Trimming at most the
-    three bytes of an incomplete UTF-8 sequence is enough; anything still
-    undecodable after that really is not UTF-8.
+    A 64 KiB window ending mid-`你` is not a binary file. At most the three
+    bytes of an incomplete UTF-8 sequence are suspect, so up to three trailing
+    bytes are dropped; anything still undecodable after that really is not
+    UTF-8. A window that is *entirely* an incomplete character (a 1-byte
+    window over `你`) decodes to "" — the honest answer is "the window ended
+    before one character fit", not "binary file".
     """
-    for cut in (1, 2, 3):
-        if cut >= len(data):
-            break
+    for cut in range(1, min(4, len(data)) + 1):
         try:
             return data[:-cut].decode("utf-8")
         except UnicodeDecodeError:
