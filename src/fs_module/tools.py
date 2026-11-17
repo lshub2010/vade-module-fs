@@ -21,6 +21,7 @@ happens — escape failures deliberately name no path at all.
 from __future__ import annotations
 
 import errno
+import json
 import os
 import shutil
 import stat as stat_module
@@ -31,6 +32,7 @@ __all__ = [
     "tool",
     "ToolFailure",
     "MAX_IO_BYTES",
+    "MAX_RESULT_BYTES",
     "DEFAULT_MAX_BYTES",
     "MAX_LIST_ENTRIES",
     "configured_roots",
@@ -43,24 +45,32 @@ __all__ = [
     "all_tools",
 ]
 
-#: Hard ceiling for one read or one write, independent of the caller's
-#: `max_bytes`. A module that can be asked for an unbounded blob is a module
-#: that can be asked to exhaust memory.
+#: Hard ceiling for one write payload. A module that can be asked for an
+#: unbounded blob is a module that can be asked to exhaust memory.
 MAX_IO_BYTES = 1024 * 1024
 
-#: Default `fs_read` window: a model asking for "a file" usually wants a peek,
-#: not 1 MiB of tokens.
-DEFAULT_MAX_BYTES = 65_536
+#: Budget for one *tool result*, measured on the JSON the SDK actually sends
+#: (`json.dumps(..., ensure_ascii=False, separators=(",", ":"))`). A v1 frame
+#: carries at most 65519 plaintext bytes and v1 has no fragmentation, so the
+#: budget leaves ~16 KiB for the JSON-RPC envelope, the error/duration fields
+#: and the Noise tag. `fs_read` and `fs_list` are bounded by this; `fs_stat`
+#: and `fs_write`/`fs_delete` return fixed tiny shapes and need no trimming.
+MAX_RESULT_BYTES = 48 * 1024
 
-#: `fs_list` returns at most this many entries; `truncated` says whether the
-#: directory had more. Reading a directory is otherwise unbounded work.
+#: Default `fs_read` window: a model asking for "a file" usually wants a peek,
+#: not 48 KiB of tokens. Well inside `MAX_RESULT_BYTES` even after JSON
+#: escaping, so a default read is never trimmed by the budget.
+DEFAULT_MAX_BYTES = 32_768
+
+#: `fs_list` returns at most this many entries before the byte budget is even
+#: applied; `truncated` says whether the directory had more. Reading a
+#: directory is otherwise unbounded work.
 MAX_LIST_ENTRIES = 10_000
 
 #: One plaintext frame of the v1 transport is 65519 bytes and v1 has no
-#: fragmentation. `fs_read` can locally return up to `MAX_IO_BYTES`, but a
-#: result bigger than a frame cannot be sent to core — see README "Frame
-#: ceiling". Kept as a documented constant so the limitation is visible to
-#: readers instead of being discovered in production.
+#: fragmentation. Kept as a documented constant next to `MAX_RESULT_BYTES` so
+#: the reason for the 48 KiB budget is visible to readers instead of being
+#: rediscovered in production.
 FRAME_PLAINTEXT_BYTES = 65_519
 
 
@@ -225,12 +235,47 @@ def _kind_of(mode: int) -> str:
     return "other"
 
 
+# ----------------------------------------------------------------------- budget
+
+
+def _json_bytes(value: Any) -> int:
+    """Size of `value` the way `vade_sdk.transport` serialises a result.
+
+    Compact separators, `ensure_ascii=False`: the SDK's own settings. Measuring
+    the serialised form rather than the raw text is what makes the budget a
+    promise instead of an estimate — escaping (`"` → `\\"`, a newline → `\\n`)
+    is counted where it actually costs bytes.
+    """
+    return len(json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+
+
+def _fit_text_to_budget(text: str) -> dict[str, Any]:
+    """Cut `text` until its JSON result fits `MAX_RESULT_BYTES`.
+
+    Only escaping pushes a window over budget, so the cut is usually a handful
+    of characters. Binary search keeps it O(log n) serialisations instead of
+    one per character; `truncated` is True because the caller got less text
+    than the file holds in the requested window.
+    """
+    low, high = 0, len(text)
+    while low < high:
+        middle = (low + high + 1) // 2
+        candidate = text[:middle]
+        probe = {"text": candidate, "bytes": len(candidate.encode("utf-8")), "truncated": True}
+        if _json_bytes(probe) <= MAX_RESULT_BYTES:
+            low = middle
+        else:
+            high = middle - 1
+    fitted = text[:low]
+    return {"text": fitted, "bytes": len(fitted.encode("utf-8")), "truncated": True}
+
+
 # ------------------------------------------------------------------------ tools
 
 
 @tool(
     "fs_list",
-    "列出目录下的直接子项（不递归）：name/kind/size/mtime；超过 10000 条截断",
+    "列出目录下的直接子项（不递归）：name/kind/size/mtime；超过 10000 条或结果超过 48 KiB 截断",
     timeout_ms=10_000,
     idempotent=True,
 )
@@ -283,7 +328,22 @@ def fs_list(path: str) -> dict[str, Any]:
         _raise_os(exc, relative)
 
     entries.sort(key=lambda item: item["name"])
-    return {"entries": entries, "truncated": truncated}
+
+    # Entry cap bounds the scan; the byte budget bounds the frame. Charge the
+    # whole result — scaffold keys, punctuation and the `truncated` flag — then
+    # add entries in name order while they fit. String escaping is context
+    # free, so an entry serialised alone is byte-identical when nested.
+    scaffold = _json_bytes({"entries": [], "truncated": False})  # "false" is the longer word
+    spent = 0
+    kept: list[dict[str, Any]] = []
+    for entry in entries:
+        cost = _json_bytes(entry) + (1 if kept else 0)  # comma between entries
+        if scaffold + spent + cost > MAX_RESULT_BYTES:
+            truncated = True
+            break
+        kept.append(entry)
+        spent += cost
+    return {"entries": kept, "truncated": truncated}
 
 
 @tool(
@@ -314,10 +374,10 @@ def fs_stat(path: str) -> dict[str, Any]:
     idempotent=True,
 )
 def fs_read(path: str, max_bytes: int = DEFAULT_MAX_BYTES) -> dict[str, Any]:
-    """Read at most `max_bytes` of UTF-8 text (hard ceiling `MAX_IO_BYTES`)."""
+    """Read at most `max_bytes` of UTF-8 text (hard ceiling `MAX_RESULT_BYTES`)."""
     window = _require_int(max_bytes, "max_bytes")
-    if window < 1 or window > MAX_IO_BYTES:
-        raise ToolFailure("INVALID_ARGUMENT", f"max_bytes must be within [1, {MAX_IO_BYTES}]")
+    if window < 1 or window > MAX_RESULT_BYTES:
+        raise ToolFailure("INVALID_ARGUMENT", f"max_bytes must be within [1, {MAX_RESULT_BYTES}]")
 
     real, _root, relative = resolve_path(path)
     try:
@@ -349,7 +409,12 @@ def fs_read(path: str, max_bytes: int = DEFAULT_MAX_BYTES) -> dict[str, Any]:
         if text is None:
             raise ToolFailure("INVALID_ARGUMENT", f"{relative} is not valid UTF-8 text") from None
 
-    return {"text": text, "bytes": len(text.encode("utf-8")), "truncated": truncated}
+    result = {"text": text, "bytes": len(text.encode("utf-8")), "truncated": truncated}
+    if _json_bytes(result) > MAX_RESULT_BYTES:
+        # Escaping (quotes, backslashes, control characters) can inflate a
+        # window that is inside the limit on disk past the limit on the wire.
+        return _fit_text_to_budget(text)
+    return result
 
 
 def _decode_truncated(data: bytes) -> str | None:

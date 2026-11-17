@@ -11,6 +11,7 @@ Two things are tested here on purpose and they are not the same thing:
 from __future__ import annotations
 
 import ast
+import json
 import os
 import re
 import stat as stat_module
@@ -64,10 +65,19 @@ def test_no_sdk_import_in_tools():
     assert not [name for name in imported if name == "vade" or name.startswith("vade.")]
 
 
+def _wire_size(result) -> int:
+    """Bytes the SDK puts on the wire for `result` (compact, UTF-8, unescaped)."""
+    return len(json.dumps(result, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+
+
 def test_documented_limits():
     assert tools.MAX_IO_BYTES == 1024 * 1024
-    assert tools.DEFAULT_MAX_BYTES == 65_536
+    assert tools.MAX_RESULT_BYTES == 48 * 1024
+    assert tools.DEFAULT_MAX_BYTES == 32_768
     assert tools.MAX_LIST_ENTRIES == 10_000
+    # The budget must leave room for the envelope inside one v1 frame.
+    assert tools.MAX_RESULT_BYTES < tools.FRAME_PLAINTEXT_BYTES
+    assert tools.DEFAULT_MAX_BYTES < tools.MAX_RESULT_BYTES
 
 
 def test_every_tool_is_decorated_and_unique():
@@ -207,6 +217,33 @@ def test_list_not_truncated_at_exactly_the_cap(box: Sandbox, monkeypatch: pytest
     assert result["truncated"] is False
 
 
+def test_list_truncates_to_the_byte_budget_in_name_order(box: Sandbox):
+    """10 000 entries of 100 B serialise to ~1 MB; the frame holds 48 KiB."""
+    names = [f"entry-{index:04d}-{'x' * 40}.txt" for index in range(1_200)]
+    for name in names:
+        (box.root / name).write_text("x", encoding="utf-8")
+
+    result = tools.fs_list(".")
+    assert result["truncated"] is True
+    assert 0 < len(result["entries"]) < len(names)
+    assert _wire_size(result) <= tools.MAX_RESULT_BYTES
+    assert _wire_size(result) < tools.FRAME_PLAINTEXT_BYTES
+
+    returned = [entry["name"] for entry in result["entries"]]
+    assert returned == sorted(names)[: len(returned)]
+
+
+def test_list_budget_counts_names_that_need_escaping(box: Sandbox):
+    """A quote in a name costs two wire bytes; the budget measures the wire."""
+    names = [f"{'q' * 40}\".txt-{index:04d}" for index in range(900)]
+    for name in names:
+        (box.root / name).write_text("x", encoding="utf-8")
+
+    result = tools.fs_list(".")
+    assert result["truncated"] is True
+    assert _wire_size(result) <= tools.MAX_RESULT_BYTES
+
+
 def test_list_rejects_a_file_and_a_missing_path(box: Sandbox):
     (box.root / "a.txt").write_text("hi", encoding="utf-8")
     _failure("INVALID_ARGUMENT", tools.fs_list, "a.txt")
@@ -259,11 +296,31 @@ def test_read_truncates_at_max_bytes_without_error(box: Sandbox):
     assert result == {"text": "x" * 10, "bytes": 10, "truncated": True}
 
 
-def test_read_default_window_is_65536(box: Sandbox):
+def test_read_default_window_is_32768(box: Sandbox):
     (box.root / "big.txt").write_text("a" * (tools.DEFAULT_MAX_BYTES + 10), encoding="utf-8")
     result = tools.fs_read("big.txt")
     assert result["bytes"] == tools.DEFAULT_MAX_BYTES
     assert result["truncated"] is True
+    assert _wire_size(result) <= tools.MAX_RESULT_BYTES
+
+
+def test_read_hard_ceiling_is_the_result_budget(box: Sandbox):
+    """`max_bytes` cannot ask for a result the frame cannot carry."""
+    (box.root / "a.txt").write_text("x", encoding="utf-8")
+    assert tools.fs_read("a.txt", max_bytes=tools.MAX_RESULT_BYTES)["bytes"] == 1
+    _failure("INVALID_ARGUMENT", tools.fs_read, "a.txt", max_bytes=tools.MAX_RESULT_BYTES + 1)
+
+
+def test_read_trims_an_escape_inflated_window_to_the_budget(box: Sandbox):
+    """49152 quote characters serialise to twice that; the result must still fit."""
+    (box.root / "quotes.txt").write_text('"' * (tools.MAX_RESULT_BYTES * 2), encoding="utf-8")
+    result = tools.fs_read("quotes.txt", max_bytes=tools.MAX_RESULT_BYTES)
+
+    assert result["truncated"] is True
+    assert result["bytes"] == len(result["text"].encode("utf-8"))
+    assert 0 < result["bytes"] < tools.MAX_RESULT_BYTES
+    assert set(result["text"]) == {'"'}
+    assert _wire_size(result) <= tools.MAX_RESULT_BYTES
 
 
 def test_read_trims_a_multibyte_character_cut_by_the_window(box: Sandbox):
@@ -292,7 +349,7 @@ def test_read_rejects_binary_and_invalid_utf8(box: Sandbox):
 
 def test_read_window_must_be_inside_the_hard_limit(box: Sandbox):
     (box.root / "a.txt").write_text("x", encoding="utf-8")
-    for bad in (0, -1, tools.MAX_IO_BYTES + 1, True, "10", 1.5):
+    for bad in (0, -1, tools.MAX_RESULT_BYTES + 1, tools.MAX_IO_BYTES + 1, True, "10", 1.5):
         _failure("INVALID_ARGUMENT", tools.fs_read, "a.txt", max_bytes=bad)
 
 

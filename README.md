@@ -10,7 +10,7 @@
 |---|---|---|---|---|---|
 | `fs_list` | `fs.list` | `fs_list(path: str)` | `{entries:[{name,kind,size,mtime}], truncated}` | low | true |
 | `fs_stat` | `fs.stat` | `fs_stat(path: str)` | `{kind,size,mtime,mode}` | low | true |
-| `fs_read` | `fs.read` | `fs_read(path: str, max_bytes: int = 65536)` | `{text,bytes,truncated}` | low | true |
+| `fs_read` | `fs.read` | `fs_read(path: str, max_bytes: int = 32768)` | `{text,bytes,truncated}` | low | true |
 | `fs_write` | `fs.write` | `fs_write(path: str, content: str, create_parents: bool = false)` | `{bytes,created}` | **high** | **false** |
 | `fs_delete` | `fs.delete` | `fs_delete(path: str, recursive: bool = false)` | `{deleted}` | **high** | true |
 
@@ -25,7 +25,7 @@
 - `mtime`：epoch 秒（int），不返回纳秒。
 - `stat.mode`：权限位（`st_mode & 0o777`，int，例如 `0o640` = 416）。
 - `entry.kind`：`file` | `dir` | `symlink`，**只描述目录项本身**（`scandir` 不跟随）。
-- `read.bytes`：返回的 `text` 的 UTF-8 字节数（截断后可能小于文件大小）。
+- `read.bytes`：返回的 `text` 的 UTF-8 字节数（窗口截断或结果预算截断后都可能小于文件大小）。
 - `write.created`：写之前文件是否不存在；`write.bytes` 是写入内容的字节数。
 
 ## 安全模型（本模块的重点）
@@ -84,16 +84,23 @@ raise ToolFailure("PERMISSION_DENIED", "path escapes the configured roots")
 `list` 用 `scandir(follow_symlinks=False)` + `lstat` 语义，所以"看一眼"不会把
 根外的 inode 暴露出来（连 `size` 都是链接自身的长度）。
 
-### 4. 上限
+### 4. 上限与结果预算
 
 | 上限 | 值 | 触发 |
 |---|---|---|
-| 单次读 | 1 MiB（`MAX_IO_BYTES`） | `max_bytes` 超出 `[1, 1048576]` → `INVALID_ARGUMENT` |
-| 单次写 | 1 MiB | 内容超出 → `PAYLOAD_TOO_LARGE`，文件不会被创建/截断 |
-| `list` 条目 | 10 000（`MAX_LIST_ENTRIES`） | 超出 → 只返回前 10 000 条，`truncated=true` |
+| 结果预算 | 48 KiB（`MAX_RESULT_BYTES`） | 结果的 JSON 超过它 → `read` 截短文本 / `list` 少放条目，`truncated=true` |
+| 单次读窗口 | 默认 32 KiB，硬顶 48 KiB | `max_bytes` 超出 `[1, 49152]` → `INVALID_ARGUMENT` |
+| 单次写 | 1 MiB（`MAX_IO_BYTES`） | 内容超出 → `PAYLOAD_TOO_LARGE`，文件不会被创建/截断 |
+| `list` 扫描条目 | 10 000（`MAX_LIST_ENTRIES`） | 超出 → 先只扫前 10 000 条，再按字节预算截，`truncated=true` |
+
+预算按 SDK **实际写上线的方式**度量：`json.dumps(..., ensure_ascii=False, separators=(",", ":"))`
+的 UTF-8 字节数，所以 `"` → `\"`、换行 → `\n` 这类转义膨胀都算在内。48 KiB 是
+65519 字节一帧里留给结果的份额，剩下 ~16 KiB 给 JSON-RPC 信封与 Noise tag。
 
 `read` 永远只读 `max_bytes + 1` 个字节（多读 1 字节只为判断是否截断），
 所以 4 GiB 的文件不会被读进内存。截断**不是错误**：`truncated=true`。
+默认 32 KiB 在序列化后仍远低于预算；只有 `max_bytes` 贴着硬顶时，JSON 信封与
+转义（`"`、`\`、换行）才会让文本再被截短一些——`bytes` 始终是实际返回的字节数。
 
 ### 5. 错误码与信息
 
@@ -147,7 +154,7 @@ modules/fs/
 pip install -e sdk/python          # 或 pip install "vade-sdk==0.1.*"
 pip install -e modules/fs
 
-pytest modules/fs/tests -q         # 65 passed（无 core；无 SDK 时 server 测试 skip）
+pytest modules/fs/tests -q         # 70 passed（无 core；无 SDK 时 server 测试 skip）
 python -m fs_module --check        # exit 0，并把 manifest 打到 stdout
 
 FS_ROOTS=/data/workspace \
@@ -178,15 +185,21 @@ CORE_PUBLIC_KEY=<64 hex> MODULE_KEY_PATH=data/module.key \
 `concurrency="exclusive"`：一个实例独占根目录。两个实例会互写同一批文件，而
 `fs_write` 不是幂等的。
 
-## Frame ceiling（部署前必读）
+## 结果预算与 Frame ceiling（部署前必读）
 
-v1 传输**没有分片**，一帧明文上限 65519 字节（`FRAME_PLAINTEXT_BYTES`）。本模块
-本地允许 `fs_read` 返回最多 1 MiB，但超过一帧的结果**发不出去**：transport 会在
-`payload > 65519` 时直接 `PAYLOAD_TOO_LARGE` 并断开（fatal）。
+v1 传输**没有分片**，一帧明文上限 65519 字节（`FRAME_PLAINTEXT_BYTES`）。Transport
+在 `payload > 65519` 时直接 `PAYLOAD_TOO_LARGE` 并断开（fatal），所以本模块不按
+"文件/目录多大" 设上限，而按"结果上线后多大"设：`MAX_RESULT_BYTES = 48 KiB`，
+度量的是 SDK 实际序列化出的整个结果 JSON（紧凑分隔符、`ensure_ascii=False`），
+剩余 ~16 KiB 留给 JSON-RPC 信封与 Noise tag。
 
-所以对 core 部署时把 `max_bytes` 控制在 ~60000 以内（默认 65536 已经贴着上限，
-JSON 包装后可能超出）；1 MiB 是本地硬上限（防内存放大），不是"一定能送达"的承诺。
-`--standalone` 不经过 transport，不受此限。
+- `fs_read`：默认窗口 32 KiB，硬顶 48 KiB。`max_bytes` 是磁盘窗口；若转义把结果
+  撑过预算，文本会再被截短并置 `truncated=true`，`bytes` 是实际返回的字节数。
+- `fs_list`：先按 10 000 条封顶扫描，再按名字序逐条累加序列化字节数，放不下就停，
+  `truncated=true`。条目的转义也按同样方式计入。
+- `fs_stat` / `fs_write` / `fs_delete`：定长小结果，不受此预算影响。
+
+`--standalone` 不经过 transport，但仍然走同一层结果预算（截断发生在工具内部）。
 
 ## 容器
 

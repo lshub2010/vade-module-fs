@@ -119,6 +119,27 @@ async def test_unknown_tool_is_not_found(app):
     assert (await app.call_tool("shell_exec", {"cmd": "id"}))["error"]["code"] == "NOT_FOUND"
 
 
+async def test_the_largest_results_fit_in_one_v1_frame(app, tmp_path, monkeypatch):
+    """The budget is a transport promise: result + envelope ≤ 65519 bytes."""
+    monkeypatch.setenv("FS_ROOTS", str(tmp_path))
+    monkeypatch.delenv("FS_DATA_DIR", raising=False)
+    (tmp_path / "big.txt").write_text('"' * (tools.MAX_RESULT_BYTES * 2), encoding="utf-8")
+    for index in range(600):
+        (tmp_path / f"entry-{index:04d}-{'x' * 40}.txt").write_text("x", encoding="utf-8")
+
+    calls = (
+        ("fs_read", {"path": "big.txt", "max_bytes": tools.MAX_RESULT_BYTES}),
+        ("fs_list", {"path": "."}),
+    )
+    for name, args in calls:
+        envelope = await app.call_tool(name, args)
+        assert envelope["ok"] is True, envelope
+        result_size = len(json.dumps(envelope["result"], ensure_ascii=False, separators=(",", ":")).encode())
+        assert result_size <= tools.MAX_RESULT_BYTES
+        frame = json.dumps(envelope, ensure_ascii=False, separators=(",", ":")).encode()
+        assert len(frame) <= tools.FRAME_PLAINTEXT_BYTES
+
+
 async def test_wrong_type_is_rejected_by_the_sdk(app, tmp_path, monkeypatch):
     monkeypatch.setenv("FS_ROOTS", str(tmp_path))
     envelope = await app.call_tool("fs_read", {"path": "a.txt", "max_bytes": "10"})

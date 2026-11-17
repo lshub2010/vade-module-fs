@@ -2,7 +2,7 @@
   "capabilities": {
     "tools": [
       {
-        "description": "列出目录下的直接子项（不递归）：name/kind/size/mtime；超过 10000 条截断",
+        "description": "列出目录下的直接子项（不递归）：name/kind/size/mtime；超过 10000 条或结果超过 48 KiB 截断",
         "idempotent": true,
         "input_schema": {
           "additionalProperties": false,
@@ -46,7 +46,7 @@
           "additionalProperties": false,
           "properties": {
             "max_bytes": {
-              "default": 65536,
+              "default": 32768,
               "type": "integer"
             },
             "path": {
